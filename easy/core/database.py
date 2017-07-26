@@ -7,8 +7,8 @@ from datetime import datetime
 import logging
 
 client = MongoClient()
-filedb = client.get_database('file')
-col = filedb.data
+filedb = client.easy
+col = filedb.file
 
 def metadata2mongo(fullpath, logging):
     file = open(fullpath, 'r')
@@ -19,6 +19,7 @@ def metadata2mongo(fullpath, logging):
 
     for lastline in file:
         try:
+            year_and_month = None
             if lastline.startswith('FILE['):
                 metakey = lastline[: lastline.rindex("=")]
                 data = lastline[lastline.rindex("=") + 1 :].rstrip()
@@ -63,18 +64,20 @@ def metadata2mongo(fullpath, logging):
                 if name:
                     if not dataset_files.has_key(name):
                         dataset_files[name] = {}
-                    if metakey.endswith("PID"):
-                        dataset_files[name]['pid'] = data
+                    # 'pid' is excluded because it is not needed in the produced reports
+                    # if metakey.endswith("PID"):
+                    #     dataset_files[name]['pid'] = data
                     elif metakey.endswith("size"):
-                        dataset_files[name]['size'] = data
+                        size = long(data)
                     elif metakey.endswith("mimeType"):
-                        dataset_files[name]['mimeType'] = data
+                        dataset_files[name]['mimeType'] = data.lower()
                     elif metakey.endswith("creatorRole"):
                         dataset_files[name]['creatorRole'] = data
-                    elif metakey.endswith("accessibleTo"):
-                        dataset_files[name]['accessibleTo'] = data
-                    elif metakey.endswith("visibleTo"):
-                        dataset_files[name]['visibleTo'] = data
+                    # 'accessibleTo' and 'visibleTo' are excluded because they are not needed in the produced reports
+                    # elif metakey.endswith("accessibleTo"):
+                    #     dataset_files[name]['accessibleTo'] = data
+                    # elif metakey.endswith("visibleTo"):
+                    #     dataset_files[name]['visibleTo'] = data
                 else:
                     logging.error("No filename found in item %s", metakey)
         except:
@@ -88,19 +91,26 @@ def metadata2mongo(fullpath, logging):
     metadata['format'] = format
     metadata['type'] = type
     metadata['subject'] = subject
+    nr_files = 0
     for file_name, file_data in dataset_files.iteritems():
-        dataset_file2mongo(metadata['pid'], metadata.get('dateSubmitted', None), file_name, file_data)
+        nr_files += 1
+        dataset_file2mongo(metadata['pid'], metadata.get('dateSubmitted', None), file_name, file_data, size)
+    metadata['files'] = nr_files
 
     return metadata
 
-def dataset_file2mongo(dataset_pid, date_submitted, file_name, file_data):
-    file_data['name'] = file_name
+def dataset_file2mongo(dataset_pid, date_submitted, file_name, file_data, size):
+
+    # 'name' is excluded because it is not needed in the produced reports
+    # file_data['name'] = file_name
     if file_name.rfind('.') > 0:
-        file_data['extension'] = file_name[file_name.rfind('.') + 1:]
+        file_data['extension'] = file_name[file_name.rfind('.') + 1:].lower()
     file_data['datasetPid'] = dataset_pid
     file_data['dateSubmitted'] = date_submitted
     try:
-        col.insert_one(file_data)
+        # If a document with identical values is found, the count value of the document is increased by 1
+        # and the size value is accumulated. Otherwise a new document is created.
+        col.find_one_and_update(file_data, {'$inc': {'count': 1, 'size': size}}, upsert=True)
     except:
         logging.error("in inserting file %s of dataset %s into 'file' database" % (file_name, dataset_pid))
 
@@ -111,44 +121,54 @@ def log_file2mongo(path, col, report):
     outfile = open(report,'w')
     file.readline()
 
+    logging.info("Starting to parse file %s " % (fullpath))
     for lastline in file:
         lastline = lastline[:-1]
         try:
-            logging.info("inserting line %s of file %s " % (lastline, fullpath))
-            col.insert_one(get_log_details(lastline, outfile))
+            log_details = get_log_details(lastline, outfile)
+            if log_details:
+                logging.info("adding line %s of file %s " % (lastline, fullpath))
+                # If a document with identical values is found, the count value of the document is increased by 1.
+                # Otherwise a new document is created.
+                nr_of_files = int(lastline.count("FILE_NAME"))
+                if nr_of_files > 0:
+                    col.find_one_and_update(get_log_details(lastline, outfile), {'$inc': { 'count' : 1, 'files' : nr_of_files}}, upsert=True)
+                else:
+                    col.find_one_and_update(get_log_details(lastline, outfile), {'$inc': {'count': 1}}, upsert=True)
         except:
             logging.error("in inserting line %s into 'logs' database" % lastline)
+    logging.info("Finished parsing file %s " % (fullpath))
 
     outfile.close()
 
 def get_log_details(line, outfile):
-    search_results = {}
-    parts = re.compile("\s+\;\s+").split(line)
-    search_results['date'] = re.search(r"^(\d{4}-\d{2}-\d{2}).*", parts[0])
-    search_results['type'] = re.search(r"^.+ - (.*).*", parts[0])
-    search_results['user'] = re.search(r"(.*)", parts[1])
-    search_results['roles'] = re.search(r".+\((.*)\).*", parts[2])
-    search_results['groups'] = re.search(r".+\((.*)\).*", parts[3])
-    search_results['ip'] = re.search(r"(.*)", parts[4])
-
     details = {}
-    for k, v in search_results.iteritems():
-        value = get_value(v)
-        if k == 'date':
-            details[k] = datetime(int(value[:4]), int(value[5:7]), int(value[8:10]))
-        else:
-            details[k] = value
-    report = "ip: %s type: %s" % (parts[4], get_value(search_results['type']))
+    parts = re.compile("\s+\;\s+").split(line)
 
-    if len(parts) >= 6:
-        value = get_value(re.search(r".*DATASET_ID.*\"(.*)\".*", parts[5]))
-        if value:
-            details['dataset'] = value
-            report += (" dataset: %s" % value)
+    date = get_value(re.search(r"^(\d{4}-\d{2}-\d{2}).*", parts[0]))
+    details['date'] = datetime(int(date[:4]), int(date[5:7]), int(date[8:10]))
+    details['type'] = get_value(re.search(r"^.+ - (.*).*", parts[0]))
+    details['user'] = get_value(re.search(r"(.*)", parts[1]))
+    details['roles'] = get_value(re.search(r".+\((.*)\).*", parts[2]))
+    # 'groups' and 'ip' are excluded because they are not needed in the produced reports
+    # details['groups'] = get_value(re.search(r".+\((.*)\).*", parts[3]))
+    # details['ip'] = get_value(re.search(r"(.*)", parts[4]))
 
-    outfile.write(report + "\n")
+    if details['type'] in ('DATASET_DEPOSIT', 'DATASET_PUBLISHED', 'DOWNLOAD_DATASET_REQUEST', 'DOWNLOAD_FILE_REQUEST', 'FILE_DEPOSIT'):
+        details['dataset'] = get_value(re.search(r".*DATASET_ID.*\"(.*)\".*", parts[5]))
+        if details['type'] in ('DATASET_VIEWED', 'DATASET_PUBLISHED', 'DOWNLOAD_DATASET_REQUEST', 'DOWNLOAD_FILE_REQUEST'):
+            details['discipline'] = get_value(re.search(r".*SUB_DISCIPLINE_LABEL\: *\"([a-zA-Z \-\(\)\,]*)\".*", line))
 
-    return details
+        report = "type: %s date: %s user: %s roles: %s ip: %s" % (details['type'], details['date'], details['user'], details['roles'], parts[4])
+        if details.get('dataset', None):
+            report += (" dataset: %s" % details['dataset'])
+        if details.get('discipline', None):
+            report += (" discipline: %s" % details['discipline'])
+        outfile.write(report + "\n")
+        return details
+    else:
+        return None
+
 
 def get_value(search_result):
     if search_result:
