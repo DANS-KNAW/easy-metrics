@@ -1,14 +1,38 @@
 #!/usr/bin/python
 from __future__ import print_function, absolute_import
 
+import sys
 import re
 from pymongo import MongoClient
 from datetime import datetime
 import logging
 
+INFO = 'info'
+ERROR = 'error'
+WARN = 'warn'
+
 client = MongoClient()
 filedb = client.easy
-col = filedb.file
+collection_file = filedb.file
+collection_logs = filedb.logs
+collection_status = filedb.status
+
+def log_message(level, message, console=True):
+    if level == INFO:
+        logging.info(message)
+    elif level == ERROR:
+        logging.error(message)
+    elif level == WARN:
+        logging.warn(message)
+    if console:
+        print(message)
+
+
+def get_last_imported_dataset_number():
+    return collection_status.find_one({ 'document': 1 })['last_dataset_number']
+
+def update_last_imported_dataset_number(number):
+    collection_status.update_one({ 'document': 1 }, { '$set': {'last_dataset_number': number}})
 
 def metadata2mongo(fullpath, logging):
     file = open(fullpath, 'r')
@@ -17,15 +41,14 @@ def metadata2mongo(fullpath, logging):
     audience, coverage, title, rights, creator, format, type, subject = [], [], [], [], [], [], [], []
     dataset_files = {}
 
-    for lastline in file:
+    for line in file:
         try:
-            year_and_month = None
-            if lastline.startswith('FILE['):
-                metakey = lastline[: lastline.rindex("=")]
-                data = lastline[lastline.rindex("=") + 1 :].rstrip()
+            if line.startswith('FILE['):
+                metakey = line[: line.rindex("=")]
+                data = line[line.rindex("=") + 1 :].rstrip()
             else:
-                metakey = lastline[: lastline.index("=")]
-                data = lastline[lastline.index("=") + 1 :].rstrip()
+                metakey = line[: line.index("=")]
+                data = line[line.index("=") + 1 :].rstrip()
 
             if metakey == 'DATASET-PID':
                 metadata["pid"] = data
@@ -36,7 +59,12 @@ def metadata2mongo(fullpath, logging):
             elif metakey == 'EMD:dateCreated':
                 metadata["dateCreated"] = data
             elif metakey == 'EMD:dateAvailable':
-                metadata["dateAvailable"] = data
+                if len(data) > 7:
+                    metadata["dateAvailable"] = datetime(int(data[:4]), int(data[5:7]), int(data[8:10]))
+                elif len(data) > 5:
+                        metadata["dateAvailable"] = datetime(int(data[:4]), int(data[5:7]), 1)
+                else:
+                    metadata["dateAvailable"] = datetime(int(data[:4]), 1, 1)
             elif metakey == 'EMD:dateSubmitted':
                 metadata["dateSubmitted"] = datetime(int(data[:4]), int(data[5:7]), int(data[8:10]))
             elif metakey == 'EMD:audience':
@@ -79,9 +107,11 @@ def metadata2mongo(fullpath, logging):
                     # elif metakey.endswith("visibleTo"):
                     #     dataset_files[name]['visibleTo'] = data
                 else:
-                    logging.error("No filename found in item %s", metakey)
+                    log_message(ERROR, "No filename found in item %s" % metakey, False)
+                    return
         except:
-            logging.error("while processing line %s" % lastline.rstrip())
+            log_message(ERROR, "while processing line %s Error: %s" % (line.rstrip(), sys.exc_info()[0]), False)
+            return
 
     metadata['audience'] = audience
     metadata['coverage'] = coverage
@@ -94,7 +124,8 @@ def metadata2mongo(fullpath, logging):
     nr_files = 0
     for file_name, file_data in dataset_files.iteritems():
         nr_files += 1
-        dataset_file2mongo(metadata['pid'], metadata.get('dateSubmitted', None), file_name, file_data, size)
+        # at this moment there are no queries where we would need more information about the files
+        # dataset_file2mongo(metadata['pid'], metadata.get('dateSubmitted', None), file_name, file_data, size)
     metadata['files'] = nr_files
 
     return metadata
@@ -110,9 +141,32 @@ def dataset_file2mongo(dataset_pid, date_submitted, file_name, file_data, size):
     try:
         # If a document with identical values is found, the count value of the document is increased by 1
         # and the size value is accumulated. Otherwise a new document is created.
-        col.find_one_and_update(file_data, {'$inc': {'count': 1, 'size': size}}, upsert=True)
+        collection_file.find_one_and_update(file_data, {'$inc': {'count': 1, 'size': size}}, upsert=True)
     except:
-        logging.error("in inserting file %s of dataset %s into 'file' database" % (file_name, dataset_pid))
+        log_message(ERROR, "in inserting file %s of dataset %s into 'file' database. Error: %s" % (file_name, dataset_pid, sys.exc_info()[0]), False)
+
+
+def dataset_submitted_event_2mongo(dataset, date, discipline, nr_of_files):
+    details = {}
+    details['dataset'] = dataset
+    details['discipline'] = discipline
+    details['date'] = date
+    details['type'] = 'DATASET_SUBMITTED'
+    details['user'] = None
+    details['roles'] = None
+    details['groups'] = None
+    details['ip'] = 'INSERTED BY THE IMPORT TOOL'
+    if nr_of_files > 0:
+        details['files'] = nr_of_files
+
+    try:
+        collection_logs.insert_one(details)
+        log_message(INFO, "DATASET_SUBMITTED event added into the 'logs' collection for dataset %s " % dataset, False)
+    except:
+        log_message(ERROR, "in inserting DATASET_SUBMITTED event for dataset %s into 'logs' collection. Error: %s" % (dataset, sys.exc_info()[0]), False)
+        return
+
+    return True
 
 
 def log_file2mongo(path, col, report):
@@ -121,25 +175,16 @@ def log_file2mongo(path, col, report):
     outfile = open(report,'w')
     file.readline()
 
-    logging.info("Starting to parse file %s " % (fullpath))
     for lastline in file:
         lastline = lastline[:-1]
         try:
             nr_of_files = int(lastline.count("FILE_NAME"))
             log_details = get_log_details(lastline, nr_of_files, outfile)
             if log_details:
-                logging.info("adding line %s of file %s " % (lastline, fullpath))
-                # If a document with identical values is found, the count value of the document is increased by 1.
-                # Otherwise a new document is created.
-                nr_of_files = int(lastline.count("FILE_NAME"))
-                # if nr_of_files > 0:
-                #     col.find_one_and_update(get_log_details(lastline, outfile), {'$inc': { 'count' : 1, 'files' : nr_of_files}}, upsert=True)
-                # else:
-                #     col.find_one_and_update(get_log_details(lastline, outfile), {'$inc': {'count': 1}}, upsert=True)
+                log_message(INFO, "adding line %s of file %s " % (lastline, fullpath), False)
                 col.insert_one(log_details)
         except:
-            logging.error("in inserting line %s into 'logs' database" % lastline)
-    logging.info("Finished parsing file %s " % (fullpath))
+            log_message(ERROR, "in inserting line %s into 'logs' database. Error: %s" % (lastline, sys.exc_info()[0]), False)
 
     outfile.close()
 
